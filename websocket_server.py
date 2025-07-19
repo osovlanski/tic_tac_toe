@@ -1,168 +1,331 @@
 """
-CLI WebSocket Client for Tic-Tac-Toe Game
-Provides terminal-based interface for playing the game
+WebSocket Server Implementation
+Handles client connections and game logic coordination
 """
 
+import asyncio
 import websockets
 import json
-from typing import Optional
+import logging
+import argparse
+import uuid
+from typing import Dict, Set
+from game_state import GameState, GameStatus, Player
+from redis_sync import RedisSyncManager, CHANNELS
 
-class TicTacToeClient:
-    def __init__(self, server_url: str):
-        self.server_url = server_url
-        self.websocket: Optional[websockets.WebSocketClientProtocol] = None
-        self.player_id: Optional[str] = None
-        self.game_board = [["" for _ in range(3)] for _ in range(3)]
-        self.game_status = "waiting"
-        self.current_turn = None
-        self.player_count = 0
-        self.connected = False
-        self.input_thread = None
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+class TicTacToeServer:
+    def __init__(self, server_id: str, port: int):
+        self.server_id = server_id
+        self.port = port
+        self.clients: Dict[websockets.WebSocketServerProtocol, str] = {}  # websocket -> player_id
+        self.game_state = GameState()
+        self.redis_sync = RedisSyncManager()
         
-    def display_board(self):
-        """Display the current game board in ASCII format."""
-        print("\n" + "="*20)
-        print("   TIC-TAC-TOE")
-        print("="*20)
-        print("\nCurrent Board:")
-        print("   0   1   2")
-        for i, row in enumerate(self.game_board):
-            row_display = f"{i}  "
-            for j, cell in enumerate(row):
-                display_cell = cell if cell else " "
-                row_display += f" {display_cell} "
-                if j < 2:
-                    row_display += "|"
-            print(row_display)
-            if i < 2:
-                print("  -----------")
+        # Subscribe to Redis channels
+        self.redis_sync.subscribe_to_channel(CHANNELS['GAME_SYNC'], self.handle_game_sync)
+        self.redis_sync.subscribe_to_channel(CHANNELS['PLAYER_JOIN'], self.handle_player_join_sync)
+        self.redis_sync.subscribe_to_channel(CHANNELS['PLAYER_LEAVE'], self.handle_player_leave_sync)
+        self.redis_sync.subscribe_to_channel(CHANNELS['GAME_MOVE'], self.handle_game_move_sync)
+        self.redis_sync.subscribe_to_channel(CHANNELS['GAME_RESET'], self.handle_game_reset_sync)
         
-        print(f"\nGame Status: {self.game_status}")
-        if self.current_turn:
-            print(f"Current Turn: {self.current_turn}")
-        print(f"Players Connected: {self.player_count}/2")
+        # Start Redis listener
+        self.redis_sync.start_listening()
         
-        if self.player_id:
-            print(f"You are: {self.player_id}")
-        
-        if self.game_status == "in_progress":
-            if self.current_turn == self.player_id:
-                print("\n🎮 It's your turn! Enter your move.")
-            else:
-                print(f"\n⏳ Waiting for {self.current_turn}'s move...")
-        elif self.game_status == "waiting":
-            print("\n⏳ Waiting for another player to join...")
-        
-        print("\n" + "="*20)
+        # Load existing game state if any
+        self.load_game_state()
     
-    def display_help(self):
-        """Display help information."""
-        print("\n" + "="*40)
-        print("            HELP - HOW TO PLAY")
-        print("="*40)
-        print("Commands:")
-        print("  move <row> <col> - Make a move (e.g., 'move 1 2')")
-        print("  help            - Show this help message")
-        print("  quit            - Quit the game")
-        print("  reset           - Reset the game (if you're a player)")
-        print("  board           - Show current board")
-        print("\nBoard coordinates:")
-        print("  Rows and columns are numbered 0, 1, 2")
-        print("  Top-left is (0,0), bottom-right is (2,2)")
-        print("\nExample moves:")
-        print("  move 0 0  - Place in top-left")
-        print("  move 1 1  - Place in center")
-        print("  move 2 2  - Place in bottom-right")
-        print("="*40)
+    def load_game_state(self):
+        """Load game state from Redis on server startup."""
+        saved_state = self.redis_sync.get_game_state()
+        if saved_state:
+            # Reconstruct game state from saved data
+            self.game_state.board = saved_state.get('board', [["" for _ in range(3)] for _ in range(3)])
+            if saved_state.get('current_turn'):
+                self.game_state.current_turn = Player(saved_state['current_turn'])
+            self.game_state.status = GameStatus(saved_state.get('status', 'waiting'))
+            if saved_state.get('winner'):
+                self.game_state.winner = Player(saved_state['winner'])
+            self.game_state.player_count = saved_state.get('player_count', 0)
+            logger.info(f"Loaded game state from Redis: {saved_state}")
     
-    async def connect(self):
-        """Connect to the WebSocket server."""
-        try:
-            print(f"Connecting to {self.server_url}...")
-            self.websocket = await websockets.connect(
-                self.server_url,
-                ping_interval=20,
-                ping_timeout=10
-            )
-            self.connected = True
-            print("✅ Connected successfully!")
+    def save_game_state(self):
+        """Save current game state to Redis."""
+        state_dict = self.game_state.get_state_dict()
+        self.redis_sync.set_game_state(state_dict)
+    
+    async def register_client(self, websocket):
+        """Register a new client connection."""
+        player_id = str(uuid.uuid4())
+        self.clients[websocket] = player_id
+        logger.info(f"Client {player_id} connected to server {self.server_id}")
+        
+        # Send current game state to new client
+        await self.send_game_update(websocket)
+        
+        return player_id
+    
+    async def unregister_client(self, websocket):
+        """Unregister a client connection."""
+        if websocket in self.clients:
+            player_id = self.clients[websocket]
+            del self.clients[websocket]
             
-            # Join the game
-            await self.send_message({"type": "join"})
+            # Remove player from game
+            self.game_state.remove_player(player_id)
+            self.save_game_state()
             
-        except Exception as e:
-            print(f"❌ Failed to connect: {e}")
-            return False
-        
-        return True
+            # Notify other servers
+            self.redis_sync.publish_message(CHANNELS['PLAYER_LEAVE'], {
+                'server_id': self.server_id,
+                'player_id': player_id
+            })
+            
+            # Broadcast game state update
+            await self.broadcast_game_state()
+            
+            logger.info(f"Client {player_id} disconnected from server {self.server_id}")
     
-    async def disconnect(self):
-        """Disconnect from the server."""
-        self.connected = False
-        if self.websocket:
-            await self.websocket.close()
-            print("Disconnected from server.")
-    
-    async def send_message(self, message: dict):
-        """Send a message to the server."""
-        if self.websocket and self.connected:
-            try:
-                await self.websocket.send(json.dumps(message))
-            except Exception as e:
-                print(f"❌ Failed to send message: {e}")
-                self.connected = False
-    
-    async def handle_server_message(self, message: str):
-        """Handle incoming message from server."""
+    async def handle_message(self, websocket, message):
+        """Handle incoming WebSocket message from client."""
         try:
             data = json.loads(message)
             message_type = data.get('type')
+            player_id = self.clients[websocket]
             
-            if message_type == 'joined':
-                self.player_id = data.get('playerId')
-                print(f"✅ {data.get('message', 'Joined game successfully!')}")
-                self.display_board()
-                
-            elif message_type == 'update':
-                self.game_board = data.get('board', self.game_board)
-                self.current_turn = data.get('nextTurn')
-                self.game_status = data.get('status', 'waiting')
-                self.player_count = data.get('playerCount', 0)
-                self.display_board()
-                
-            elif message_type == 'win':
-                winner = data.get('winner')
-                print(f"\n🎉 Game Over! Winner: {winner}")
-                if winner == self.player_id:
-                    print("🏆 Congratulations! You won!")
-                else:
-                    print("😢 Better luck next time!")
-                self.display_board()
-                
-            elif message_type == 'draw':
-                print(f"\n🤝 Game Over! It's a draw!")
-                self.display_board()
-                
-            elif message_type == 'error':
-                error_message = data.get('message', 'Unknown error')
-                print(f"❌ Error: {error_message}")
-                
+            if message_type == 'join':
+                await self.handle_join(websocket, player_id, data)
+            elif message_type == 'move':
+                await self.handle_move(websocket, player_id, data)
+            elif message_type == 'reset':
+                await self.handle_reset(websocket, player_id)
             else:
-                print(f"📨 Server message: {data}")
+                await self.send_error(websocket, f"Unknown message type: {message_type}")
                 
         except json.JSONDecodeError:
-            print(f"❌ Invalid message from server: {message}")
+            await self.send_error(websocket, "Invalid JSON message")
         except Exception as e:
-            print(f"❌ Error handling server message: {e}")
+            logger.error(f"Error handling message: {e}")
+            await self.send_error(websocket, "Internal server error")
     
-    async def listen_for_messages(self):
-        """Listen for messages from the server."""
+    async def handle_join(self, websocket, player_id, data):
+        """Handle player join request."""
+        assigned_player = self.game_state.add_player(player_id)
+        
+        if assigned_player is None:
+            await self.send_error(websocket, "Game is full")
+            return
+        
+        # Save state and notify other servers
+        self.save_game_state()
+        self.redis_sync.publish_message(CHANNELS['PLAYER_JOIN'], {
+            'server_id': self.server_id,
+            'player_id': player_id,
+            'player_symbol': assigned_player.value
+        })
+        
+        # Send join confirmation
+        await websocket.send(json.dumps({
+            'type': 'joined',
+            'playerId': assigned_player.value,
+            'message': f'You are player {assigned_player.value}'
+        }))
+        
+        # Broadcast updated game state
+        await self.broadcast_game_state()
+        
+        logger.info(f"Player {player_id} joined as {assigned_player.value}")
+    
+    async def handle_move(self, websocket, player_id, data):
+        """Handle player move request."""
         try:
-            async for message in self.websocket:
-                await self.handle_server_message(message)
+            row = int(data.get('row'))
+            col = int(data.get('col'))
+            
+            success, message = self.game_state.make_move(player_id, row, col)
+            
+            if success:
+                # Save state and notify other servers
+                self.save_game_state()
+                self.redis_sync.publish_message(CHANNELS['GAME_MOVE'], {
+                    'server_id': self.server_id,
+                    'player_id': player_id,
+                    'row': row,
+                    'col': col
+                })
+                
+                # Broadcast game state update
+                await self.broadcast_game_state()
+                
+                # Check if game ended
+                if self.game_state.status == GameStatus.FINISHED:
+                    if self.game_state.winner:
+                        await self.broadcast_message({
+                            'type': 'win',
+                            'winner': self.game_state.winner.value
+                        })
+                    else:
+                        await self.broadcast_message({
+                            'type': 'draw',
+                            'message': 'Game ended in a draw'
+                        })
+                
+                logger.info(f"Player {player_id} moved to ({row}, {col})")
+            else:
+                await self.send_error(websocket, message)
+                
+        except (ValueError, TypeError):
+            await self.send_error(websocket, "Invalid move coordinates")
+    
+    async def handle_reset(self, websocket, player_id):
+        """Handle game reset request."""
+        self.game_state.reset()
+        self.save_game_state()
+        
+        # Notify other servers
+        self.redis_sync.publish_message(CHANNELS['GAME_RESET'], {
+            'server_id': self.server_id,
+            'player_id': player_id
+        })
+        
+        await self.broadcast_game_state()
+        logger.info(f"Game reset by player {player_id}")
+    
+    async def send_game_update(self, websocket):
+        """Send current game state to a specific client."""
+        state_dict = self.game_state.get_state_dict()
+        message = {
+            'type': 'update',
+            'board': state_dict['board'],
+            'nextTurn': state_dict['current_turn'],
+            'status': state_dict['status'],
+            'playerCount': state_dict['player_count']
+        }
+        await websocket.send(json.dumps(message))
+    
+    async def broadcast_game_state(self):
+        """Broadcast current game state to all connected clients."""
+        if not self.clients:
+            return
+        
+        state_dict = self.game_state.get_state_dict()
+        message = {
+            'type': 'update',
+            'board': state_dict['board'],
+            'nextTurn': state_dict['current_turn'],
+            'status': state_dict['status'],
+            'playerCount': state_dict['player_count']
+        }
+        
+        await self.broadcast_message(message)
+    
+    async def broadcast_message(self, message):
+        """Broadcast a message to all connected clients."""
+        if not self.clients:
+            return
+        
+        message_str = json.dumps(message)
+        disconnected_clients = []
+        
+        for websocket in self.clients:
+            try:
+                await websocket.send(message_str)
+            except websockets.exceptions.ConnectionClosed:
+                disconnected_clients.append(websocket)
+        
+        # Clean up disconnected clients
+        for websocket in disconnected_clients:
+            await self.unregister_client(websocket)
+    
+    async def send_error(self, websocket, error_message):
+        """Send error message to client."""
+        message = {
+            'type': 'error',
+            'message': error_message
+        }
+        try:
+            await websocket.send(json.dumps(message))
         except websockets.exceptions.ConnectionClosed:
-            print("❌ Connection to server lost.")
-            self.connected = False
-        except Exception as e:
-            print(f"❌ Error listening for messages: {e}")
-            self.connected = False
+            pass
+    
+    # Redis synchronization handlers
+    def handle_game_sync(self, data):
+        """Handle game state synchronization from other servers."""
+        if data.get('server_id') != self.server_id:
+            # Update from another server
+            self.load_game_state()
+            asyncio.create_task(self.broadcast_game_state())
+    
+    def handle_player_join_sync(self, data):
+        """Handle player join sync from other servers."""
+        if data.get('server_id') != self.server_id:
+            self.load_game_state()
+            asyncio.create_task(self.broadcast_game_state())
+    
+    def handle_player_leave_sync(self, data):
+        """Handle player leave sync from other servers."""
+        if data.get('server_id') != self.server_id:
+            self.load_game_state()
+            asyncio.create_task(self.broadcast_game_state())
+    
+    def handle_game_move_sync(self, data):
+        """Handle game move sync from other servers."""
+        if data.get('server_id') != self.server_id:
+            self.load_game_state()
+            asyncio.create_task(self.broadcast_game_state())
+    
+    def handle_game_reset_sync(self, data):
+        """Handle game reset sync from other servers."""
+        if data.get('server_id') != self.server_id:
+            self.load_game_state()
+            asyncio.create_task(self.broadcast_game_state())
+    
+    async def client_handler(self, websocket, path):
+        """Handle new WebSocket client connections."""
+        player_id = await self.register_client(websocket)
+        
+        try:
+            async for message in websocket:
+                await self.handle_message(websocket, message)
+        except websockets.exceptions.ConnectionClosed:
+            pass
+        finally:
+            await self.unregister_client(websocket)
+    
+    def start_server(self):
+        """Start the WebSocket server."""
+        logger.info(f"Starting Tic-Tac-Toe server {self.server_id} on port {self.port}")
+        
+        start_server = websockets.serve(
+            self.client_handler,
+            "localhost",
+            self.port,
+            ping_interval=20,
+            ping_timeout=10
+        )
+        
+        asyncio.get_event_loop().run_until_complete(start_server)
+        logger.info(f"Server {self.server_id} running on ws://localhost:{self.port}")
+        
+        try:
+            asyncio.get_event_loop().run_forever()
+        except KeyboardInterrupt:
+            logger.info(f"Server {self.server_id} shutting down...")
+        finally:
+            self.redis_sync.stop_listening()
+
+def main():
+    parser = argparse.ArgumentParser(description='Tic-Tac-Toe WebSocket Server')
+    parser.add_argument('--server-id', required=True, help='Server identifier (A or B)')
+    parser.add_argument('--port', type=int, required=True, help='Server port')
+    
+    args = parser.parse_args()
+    
+    server = TicTacToeServer(args.server_id, args.port)
+    server.start_server()
+
+if __name__ == "__main__":
+    main()
