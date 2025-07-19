@@ -22,6 +22,7 @@ class TicTacToeClient:
         self.player_count = 0
         self.connected = False
         self.input_thread = None
+        self.loop = asyncio.get_event_loop()
         
     def display_board(self):
         """Display the current game board in ASCII format."""
@@ -196,7 +197,7 @@ class TicTacToeClient:
                 
                 elif user_input == 'reset':
                     if self.player_id:
-                        asyncio.create_task(self.send_message({"type": "reset"}))
+                        asyncio.run_coroutine_threadsafe(self.send_message({"type": "reset"}), self.loop)
                         print("🔄 Reset request sent...")
                     else:
                         print("❌ You must join the game first!")
@@ -214,7 +215,7 @@ class TicTacToeClient:
                                     "row": row,
                                     "col": col
                                 }
-                                asyncio.create_task(self.send_message(message))
+                                asyncio.run_coroutine_threadsafe(self.send_message(message), self.loop)
                                 print(f"🎯 Move sent: ({row}, {col})")
                             else:
                                 print("❌ Invalid coordinates! Use 0-2 for row and column.")

@@ -55,6 +55,8 @@ class GameState:
         """
         Attempt to make a move. Returns (success, message).
         """
+        print(f"Player {player_id} attempting to make move at ({row}, {col})")
+
         # Validate game state
         if self.status != GameStatus.IN_PROGRESS:
             return False, "Game is not in progress"
