@@ -90,12 +90,12 @@ redis-server
 
 ### 2. Start Server A (Terminal 1)
 ```bash
-python3 websocket_server.py --server-id A --port 3001
+python3 websocket_server.py --server-id A --port 3001 --force-reset
 ```
 
 ### 3. Start Server B (Terminal 2)
 ```bash
-python3 websocket_server.py --server-id B --port 3002
+python3 websocket_server.py --server-id B --port 3002 --force-reset
 ```
 
 You should see output like:
@@ -105,6 +105,9 @@ INFO - Connected to Redis successfully
 INFO - Subscribed to channel: tic_tac_toe:sync
 INFO - Server A running on ws://localhost:3001
 ```
+
+Note: the force-reset parameter is for reset and create new game. 
+without it if a game already exist we can't add more playrs
 
 ## 🎮 Running CLI Clients
 

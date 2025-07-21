@@ -22,7 +22,6 @@ class TicTacToeClient:
         self.player_count = 0
         self.connected = False
         self.input_thread = None
-        self.loop = asyncio.get_event_loop()
         
     def display_board(self):
         """Display the current game board in ASCII format."""
@@ -109,6 +108,8 @@ class TicTacToeClient:
             print("Disconnected from server.")
     
     async def send_message(self, message: dict):
+        print (f"🔄 Sending message: {message}")
+
         """Send a message to the server."""
         if self.websocket and self.connected:
             try:
@@ -203,6 +204,9 @@ class TicTacToeClient:
                         print("❌ You must join the game first!")
                 
                 elif user_input.startswith('move '):
+                    # Parse move command
+                    print ("🔄 Processing move command...")
+
                     parts = user_input.split()
                     if len(parts) == 3:
                         try:
@@ -239,6 +243,8 @@ class TicTacToeClient:
         if not await self.connect():
             return
         
+        self.loop = asyncio.get_running_loop()
+
         # Start input handling in a separate thread
         self.input_thread = threading.Thread(target=self.handle_user_input)
         self.input_thread.daemon = True

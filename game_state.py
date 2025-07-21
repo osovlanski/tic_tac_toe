@@ -26,8 +26,15 @@ class GameState:
         self.board_size: int = 3  # Tic-Tac-Toe is always 3x3
     
     def add_player(self, player_id: str) -> Optional[Player]:
+        print(f"🔄 Adding player {player_id} to the game")
+        
         """Add a player to the game. Returns assigned player symbol or None if game is full."""
+        if player_id in self.players:
+            print(f"Player {player_id} is already in the game")
+            return self.players[player_id]           # already joined
+
         if self.player_count >= 2:
+            print(f"Game is full. Player {player_id} cannot join")
             return None
         
         if self.player_count == 0:
@@ -90,9 +97,11 @@ class GameState:
             self.status = GameStatus.FINISHED
             self.winner = None  # Draw
         else:
-            # Switch turns
-            self.current_turn = Player.O if self.current_turn == Player.X else Player.X
-        
+            # Switch turns and explicitly set the next player
+            self.current_turn = Player.O if player == Player.X else Player.X
+            print(f"🎮 Switched turn to: {self.current_turn.value}")
+    
+        print(f"✅ Move successful by {player.value} at ({row}, {col})")
         return True, "Move successful"
     
     def _check_win(self) -> bool:
@@ -132,12 +141,55 @@ class GameState:
             "current_turn": self.current_turn.value if self.current_turn else None,
             "status": self.status.value,
             "winner": self.winner.value if self.winner else None,
-            "player_count": self.player_count
+            "player_count": self.player_count,
+            "players": {pid: player.value for pid, player in self.players.items()}
         }
     
     def reset(self):
-        """Reset the game to initial state."""
+        print ("🔄 Resetting game state to initial values")
+
+        """Reset the game state to initial values."""
+        # Reset game board
         self.board = [["" for _ in range(3)] for _ in range(3)]
+        
+        # Reset game status
+        self.status = GameStatus.WAITING
         self.current_turn = Player.X
-        self.status = GameStatus.WAITING if self.player_count < 2 else GameStatus.IN_PROGRESS
-        self.winner = None 
+        self.winner = None
+        
+        # Reset players
+        self.players.clear()
+        self.player_count = 0
+    
+    def load_state(self, saved_state: dict):
+        """Load game state from saved data"""
+        print(f"📥 Loading state: {saved_state}")
+        
+        # Load board state
+        self.board = saved_state.get('board', [["" for _ in range(3)] for _ in range(3)])
+        
+        # Clear existing players first
+        self.players.clear()
+        self.player_count = 0
+        
+        # Load players first to ensure correct count
+        if saved_state.get('players'):
+            for player_id, symbol in saved_state.get('players').items():
+                self.players[player_id] = Player(symbol)
+                self.player_count += 1
+        
+        # Load game status
+        self.status = GameStatus(saved_state.get('status', 'waiting'))
+        
+        # Load current turn
+        if saved_state.get('current_turn'):
+            self.current_turn = Player(saved_state['current_turn'])
+        else:
+            # Default to X's turn if not specified
+            self.current_turn = Player.X
+        
+        # Load winner if exists
+        self.winner = Player(saved_state['winner']) if saved_state.get('winner') else None
+        
+        print(f"📊 Loaded state - Players: {self.players}, Count: {self.player_count}")
+        print(f"🎮 Current turn: {self.current_turn.value}, Status: {self.status.value}")
